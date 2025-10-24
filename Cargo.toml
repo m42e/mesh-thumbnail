@@ -13,3 +13,8 @@ zip = { version = "4"}
 wavefront_obj = { version = "10" }
 image = { version = "0.25.6", features = ["jpeg", "png"]}
 regex = "1"
+base64 = "0"
+
+[profile.release]
+strip = true
+lto = true

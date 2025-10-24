@@ -1,6 +1,7 @@
+use base64::{prelude::BASE64_STANDARD, Engine};
 use clap::Parser;
 use image::{imageops::FilterType::Triangle, ImageReader};
-use std::{ffi::OsString, io::Read, num::ParseIntError, path::PathBuf};
+use std::{ffi::OsString, io::{BufRead, BufReader, Lines, Read}, num::ParseIntError, path::PathBuf};
 use clap::ValueEnum;
 use std::path;
 use three_d::*;
@@ -60,6 +61,10 @@ struct Args {
     /// Prefer 3mf thumbnail over 3mf model
     #[arg(long, default_value_t = false)]
     prefer_3mf_thumbnail: bool,
+
+    // Prefer gcode thumbnail over gcode model
+    #[arg(long, default_value_t = false)]
+    prefer_gcode_thumbnail: bool,
 
     #[arg(long, default_value_t = 1)]
     /// Amount of images to generate per file
@@ -171,6 +176,22 @@ fn main() {
             if extract_image_from_3mf(&absolute_path, args.width, args.height, &image_path).is_ok()
             {
                 continue;
+            }
+        }
+
+        if args.prefer_gcode_thumbnail
+        {
+            if filename.ends_with(".gcode") {
+                if extract_image_from_gcode_file(&absolute_path, args.width, args.height, &image_path).is_ok()
+                {
+                    continue;
+                }
+            }
+            else if filename.ends_with(".gcode.zip") {
+                if extract_iamge_from_gcode_zip(&absolute_path, args.width, args.height, &image_path).is_ok()
+                {
+                    continue;
+                }
             }
         }
 
@@ -319,6 +340,143 @@ fn extract_image_from_3mf(
         std::io::ErrorKind::NotFound,
         "thumbnail_middle.png not found in 3mf file",
     )))
+}
+
+struct GcodeImage {
+    width: u32,
+    height: u32,
+    data: Vec<u8>,
+}
+
+impl GcodeImage {
+    fn area(&self) -> u32 {
+        self.width * self.height
+    }
+}
+
+trait IterateThroughFile {
+    fn next(&mut self) -> Option<String>;
+}
+
+struct IoFileIterator {
+    reader: Lines<BufReader<File>>,
+}
+
+impl IterateThroughFile for IoFileIterator {
+    fn next(&mut self) -> Option<String> {
+        match self.reader.next() {
+            Some(Ok(line)) => Some(line),
+            _ => None,
+        }
+    }
+}
+
+struct ZipFileIterator {
+    reader: Lines<BufReader<zip::read::ZipFile<'static, File>>>
+}
+
+impl IterateThroughFile for ZipFileIterator {
+    fn next(&mut self) -> Option<String> {
+        match self.reader.next() {
+            Some(Ok(line)) => Some(line),
+            _ => None,
+        }
+    }
+}
+
+fn extract_image_from_gcode_file(
+    gcode_path : &PathBuf,
+    width : u32,
+    height : u32,
+    image_path : &PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut file = File::open(gcode_path)?;
+    extract_image_from_gcode(&mut file, width, height, image_path)
+}
+
+fn extract_iamge_from_gcode_zip(
+    gcode_zip_path : &PathBuf,
+    width : u32,
+    height : u32,
+    image_path : &PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let file = File::open(gcode_zip_path)?;
+    let mut zip = ZipArchive::new(file)?;
+
+    for i in 0..zip.len() {
+        let mut file = zip.by_index(i)?;
+        if file.name().ends_with(".gcode") {
+            return extract_image_from_gcode(&mut file, width, height, image_path);
+        }
+    }
+
+    Err("No gcode file found in zip archive".into())
+}
+
+fn extract_image_from_gcode<W>(
+    reader : &mut W,
+    width : u32,
+    height : u32,
+    image_path : &PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> where W: Read {
+    let buffered_reader = BufReader::new(reader);
+    let mut gcode_images : Vec<GcodeImage> = Vec::new();
+    let mut in_gcode_section = false;
+    let mut gcode_img_width = 0;
+    let mut gcode_img_height = 0;
+    let mut image = String::from("");
+
+    for line in buffered_reader.lines().map_while(Result::ok) {
+        if line.starts_with("; thumbnail begin") {
+            let pixel_format = match line.split(" ").skip(3).next() {
+                Some(s) => s,
+                None => continue
+            };
+
+            let pixel_format_unpacked: Vec<u32> = pixel_format.split("x").map(|f| f.parse().unwrap_or_default()).collect();
+
+            gcode_img_width = pixel_format_unpacked.get(0).unwrap_or(&0).clone();
+            gcode_img_height = pixel_format_unpacked.get(1).unwrap_or(&0).clone();
+            image = String::from("");
+
+            in_gcode_section = gcode_img_width > 0 && gcode_img_height > 0;
+        }
+        else if line.starts_with("; thumbnail end") {
+            in_gcode_section = false;
+            let image = match BASE64_STANDARD.decode(&image)  {
+                Ok(data) => data,
+                Err(e) => {
+                    println!("Error decoding base64 image data: {}", e);
+                    continue;
+                },
+            };
+
+            gcode_images.push(GcodeImage { width: gcode_img_width, height: gcode_img_height, data: image  });
+            
+        }
+        else if in_gcode_section {
+            image.push_str(line[2..].trim());
+        }
+        else if line.starts_with("; EXECUTABLE_BLOCK_START") {
+            break;
+        }
+    }
+
+    gcode_images.sort_by(|a, b| b.area().cmp(&a.area()));
+    println!("Found {} thumbnails in gcode file", gcode_images.len());
+
+    let largest_image = match gcode_images.first() {
+        Some(x) => x,
+        None => return Err("No thumbnail found in gcode file" .into()),
+    };
+
+    println!("Using gcode image {}x{}", largest_image.width, largest_image.height);
+
+    let step1 = ImageReader::new(Cursor::new(&largest_image.data)).with_guessed_format()?.decode()?;
+    let step2 = step1.resize_to_fill(width, height, Triangle);
+
+    step2.save(image_path)?;
+    return Ok(());
 }
 
 fn replace_file_stem(path: &mut PathBuf, new_stem: &str) {
