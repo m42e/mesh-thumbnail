@@ -12,6 +12,32 @@ use zip::ZipArchive;
 use zip::result::ZipError;
 use wavefront_obj::obj::{self, ObjSet};
 
+#[derive(Clone)]
+pub struct MeshWithTransform {
+    pub mesh: CpuMesh,
+    pub transform: Mat4,
+    pub color: Option<Srgba>,
+}
+
+pub struct ParseResult {
+    pub meshes: Vec<MeshWithTransform>,
+}
+
+impl ParseResult {
+    pub fn single(mesh: CpuMesh) -> Self {
+        ParseResult {
+            meshes: vec![MeshWithTransform {
+                mesh,
+                transform: Mat4::identity(),
+                color: None,
+            }],
+        }
+    }
+    
+    pub fn multiple(meshes: Vec<MeshWithTransform>) -> Self {
+        ParseResult { meshes }
+    }
+}
 
 pub enum ParseError
 {
@@ -78,11 +104,11 @@ impl From<ParseFloatError> for ParseError
     }
 }
 
-pub fn parse_file(path : &str) -> Result<CpuMesh, ParseError>
+pub fn parse_file(path : &str) -> Result<ParseResult, ParseError>
 {
     if path.ends_with(".stl")
     {
-        return parse_stl(path);
+        return Ok(ParseResult::single(parse_stl(path)?));
     }
     else if path.ends_with(".3mf")
     {
@@ -90,80 +116,387 @@ pub fn parse_file(path : &str) -> Result<CpuMesh, ParseError>
     }
     else if path.ends_with(".stl.zip")
     {
-        return parse_stl_zip(path);
+        return Ok(ParseResult::single(parse_stl_zip(path)?));
     }
     else if path.ends_with(".obj")
     {
-        return parse_obj(path);
+        return Ok(ParseResult::single(parse_obj(path)?));
     }
     else if path.ends_with(".obj.zip")
     {
-        return parse_obj_zip(path);
+        return Ok(ParseResult::single(parse_obj_zip(path)?));
     }
     else if path.ends_with(".gcode")
     {
-        return parse_gcode(path);
+        return Ok(ParseResult::single(parse_gcode(path)?));
     }
     else if path.ends_with(".gcode.zip")
     {
-        return parse_gcode_zip(path);
+        return Ok(ParseResult::single(parse_gcode_zip(path)?));
     }
 
     return Err(ParseError::ParseError(String::from("Unknown file type")));
 }
 
-fn parse_3mf(path : &str) -> Result<CpuMesh, ParseError>
+fn parse_3mf(path : &str) -> Result<ParseResult, ParseError>
 {
-    /*
-    let mut data = fs::read("model.3mf").unwrap();
-    let mut file = io::Cursor::new(data);
-     */
     let handle = File::open(path)?;
     let mfmodel = threemf::read(handle)?;
 
-    let mut positions : Vec<Vec3> = Vec::new();
-    let mut indices : Vec<u32> = Vec::new();
+    // Try to extract extruder colors from Slic3r config
+    let extruder_colors = extract_extruder_colors_from_3mf(path);
     
-    let mut all_meshes : Vec<&threemf::Mesh> = mfmodel
-        .iter()
-        .map(|f| f.resources.object.iter())
-        .flat_map(|f| f)
-        .filter(|predicate| predicate.mesh.is_some())
-        .map(|f| f.mesh.as_ref().unwrap())
-        .collect();
+    // Try to extract object/volume information from Slic3r model config
+    let object_volumes = extract_object_volumes_from_3mf(path, &extruder_colors);
 
-    all_meshes.sort_by(|a, b| a.triangles.triangle.len().cmp(&b.triangles.triangle.len()).reverse());
+    // Build a map of object ID to mesh
+    let mut object_map: HashMap<usize, &threemf::Mesh> = HashMap::new();
+    
+    for model in mfmodel.iter() {
+        for object in model.resources.object.iter() {
+            if let Some(mesh) = &object.mesh {
+                object_map.insert(object.id, mesh);
+            }
+        }
+    }
 
-    if all_meshes.len() <= 0
-    {
+    if object_map.is_empty() {
         return Err(ParseError::MeshConvertError(String::from("No meshes found in 3mf model")));
     }
 
-    let mesh = all_meshes[0];
+    let mut result_meshes: Vec<MeshWithTransform> = Vec::new();
 
-    positions.extend(mesh.vertices
-        .vertex
-            .iter()
-            .map(|a| Vec3 {
+    // Process build items (placed objects)
+    for model in mfmodel.iter() {
+        for item in model.build.item.iter() {
+            if let Some(mesh) = object_map.get(&item.objectid) {
+                // Get volume information for this object
+                let volumes = object_volumes.get(&item.objectid);
+                
+                // Create transformation matrix from build item transform
+                let transform = if let Some(t) = &item.transform {
+                    Mat4::from_cols(
+                        vec4(t[0] as f32, t[1] as f32, t[2] as f32, 0.0),
+                        vec4(t[3] as f32, t[4] as f32, t[5] as f32, 0.0),
+                        vec4(t[6] as f32, t[7] as f32, t[8] as f32, 0.0),
+                        vec4(t[9] as f32, t[10] as f32, t[11] as f32, 1.0),
+                    )
+                } else {
+                    Mat4::identity()
+                };
+
+                // If we have volume information, split into separate meshes by color
+                if let Some(vol_list) = volumes {
+                    for vol in vol_list {
+                        let mut positions: Vec<Vec3> = Vec::new();
+                        let mut indices: Vec<u32> = Vec::new();
+
+                        // Collect all vertices (we'll need them all since indices reference them)
+                        positions.extend(mesh.vertices.vertex.iter().map(|a| Vec3 {
+                            x: a.x as f32,
+                            y: a.y as f32,
+                            z: a.z as f32,
+                        }));
+
+                        // Only include triangles in this volume's range
+                        let start_tri = vol.first_triangle_id;
+                        let end_tri = vol.last_triangle_id + 1; // +1 because lastid is inclusive
+                        
+                        if end_tri <= mesh.triangles.triangle.len() {
+                            indices.extend(
+                                mesh.triangles
+                                    .triangle
+                                    .iter()
+                                    .skip(start_tri)
+                                    .take(end_tri - start_tri)
+                                    .flat_map(|a| [a.v1 as u32, a.v2 as u32, a.v3 as u32].into_iter()),
+                            );
+
+                            let cpu_mesh = CpuMesh {
+                                positions: Positions::F32(positions),
+                                indices: Indices::U32(indices),
+                                ..Default::default()
+                            };
+
+                            result_meshes.push(MeshWithTransform {
+                                mesh: cpu_mesh,
+                                transform,
+                                color: vol.color,
+                            });
+                        }
+                    }
+                } else {
+                    // No volume info, use entire mesh with single color
+                    let mut positions: Vec<Vec3> = Vec::new();
+                    let mut indices: Vec<u32> = Vec::new();
+
+                    positions.extend(mesh.vertices.vertex.iter().map(|a| Vec3 {
+                        x: a.x as f32,
+                        y: a.y as f32,
+                        z: a.z as f32,
+                    }));
+
+                    indices.extend(
+                        mesh.triangles
+                            .triangle
+                            .iter()
+                            .flat_map(|a| [a.v1 as u32, a.v2 as u32, a.v3 as u32].into_iter()),
+                    );
+
+                    let cpu_mesh = CpuMesh {
+                        positions: Positions::F32(positions),
+                        indices: Indices::U32(indices),
+                        ..Default::default()
+                    };
+
+                    result_meshes.push(MeshWithTransform {
+                        mesh: cpu_mesh,
+                        transform,
+                        color: None,
+                    });
+                }
+            }
+        }
+    }
+
+    // Fallback: if no build items found, return all meshes without transforms
+    if result_meshes.is_empty() {
+        for (_, mesh) in object_map.iter() {
+            let mut positions: Vec<Vec3> = Vec::new();
+            let mut indices: Vec<u32> = Vec::new();
+
+            positions.extend(mesh.vertices.vertex.iter().map(|a| Vec3 {
                 x: a.x as f32,
                 y: a.y as f32,
-                z: a.z as f32
+                z: a.z as f32,
             }));
 
-    indices.extend(
-        mesh.triangles.triangle
-        .iter()
-        .flat_map(|a| [a.v1 as u32, a.v2 as u32, a.v3 as u32].into_iter()));
+            indices.extend(
+                mesh.triangles
+                    .triangle
+                    .iter()
+                    .flat_map(|a| [a.v1 as u32, a.v2 as u32, a.v3 as u32].into_iter()),
+            );
 
-    Ok(
-        CpuMesh {
-            positions: Positions::F32(positions),
-            indices: Indices::U32(indices),
-            ..Default::default()
+            result_meshes.push(MeshWithTransform {
+                mesh: CpuMesh {
+                    positions: Positions::F32(positions),
+                    indices: Indices::U32(indices),
+                    ..Default::default()
+                },
+                transform: Mat4::identity(),
+                color: None,
+            });
         }
-    )
+    }
+
+    Ok(ParseResult::multiple(result_meshes))
 }
 
+// Extract extruder colors from Slic3r_PE.config in 3MF archive
+fn extract_extruder_colors_from_3mf(path: &str) -> Vec<Srgba> {
+    let mut colors = Vec::new();
+    
+    if let Ok(file) = File::open(path) {
+        if let Ok(mut zip) = ZipArchive::new(file) {
+            for i in 0..zip.len() {
+                if let Ok(mut file) = zip.by_index(i) {
+                    if file.name() == "Metadata/Slic3r_PE.config" {
+                        let mut content = String::new();
+                        if file.read_to_string(&mut content).is_ok() {
+                            // Parse extruder_colour line
+                            for line in content.lines() {
+                                if line.starts_with("; extruder_colour =") {
+                                    if let Some(colors_str) = line.split('=').nth(1) {
+                                        let color_strs: Vec<&str> = colors_str.trim().split(';').collect();
+                                        for color_str in color_strs {
+                                            if let Some(color) = parse_hex_color_to_srgba(color_str.trim()) {
+                                                colors.push(color);
+                                            }
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    
+    colors
+}
+
+#[derive(Clone)]
+struct VolumeInfo {
+    first_triangle_id: usize,
+    last_triangle_id: usize,
+    color: Option<Srgba>,
+}
+
+// Extract object-to-volume mappings with colors from Slic3r_PE_model.config
+fn extract_object_volumes_from_3mf(path: &str, extruder_colors: &[Srgba]) -> HashMap<usize, Vec<VolumeInfo>> {
+    let mut object_volumes: HashMap<usize, Vec<VolumeInfo>> = HashMap::new();
+    
+    if let Ok(file) = File::open(path) {
+        if let Ok(mut zip) = ZipArchive::new(file) {
+            for i in 0..zip.len() {
+                if let Ok(mut file) = zip.by_index(i) {
+                    if file.name() == "Metadata/Slic3r_PE_model.config" {
+                        let mut content = String::new();
+                        if file.read_to_string(&mut content).is_ok() {
+                            parse_slic3r_volumes(&content, extruder_colors, &mut object_volumes);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    
+    object_volumes
+}
+
+// Parse Slic3r_PE_model.config XML to extract volumes with their triangle ranges and colors
+fn parse_slic3r_volumes(content: &str, extruder_colors: &[Srgba], object_volumes: &mut HashMap<usize, Vec<VolumeInfo>>) {
+    let object_id_regex = Regex::new(r#"<object id="(\d+)""#).unwrap();
+    let volume_regex = Regex::new(r#"<volume firstid="(\d+)" lastid="(\d+)">"#).unwrap();
+    let object_extruder_regex = Regex::new(r#"<metadata type="object" key="extruder" value="(\d+)""#).unwrap();
+    let volume_extruder_regex = Regex::new(r#"<metadata type="volume" key="extruder" value="(\d+)""#).unwrap();
+    let color_regex = Regex::new(r#"<metadata type="volume" key="color" value="(#[0-9A-Fa-f]{6})""#).unwrap();
+    
+    let mut current_object_id: Option<usize> = None;
+    let mut object_extruder: Option<usize> = None;
+    let mut current_volumes: Vec<VolumeInfo> = Vec::new();
+    let mut in_volume = false;
+    let mut current_first_id: Option<usize> = None;
+    let mut current_last_id: Option<usize> = None;
+    let mut current_extruder: Option<usize> = None;
+    let mut current_color: Option<Srgba> = None;
+    
+    for line in content.lines() {
+        // Check for object ID
+        if let Some(caps) = object_id_regex.captures(line) {
+            // Save previous object's volumes
+            if let Some(obj_id) = current_object_id {
+                if !current_volumes.is_empty() {
+                    object_volumes.insert(obj_id, current_volumes.clone());
+                }
+            }
+            
+            // Start new object
+            current_object_id = caps.get(1).and_then(|m| m.as_str().parse().ok());
+            object_extruder = None;
+            current_volumes.clear();
+            in_volume = false;
+        }
+        
+        // Check for object-level extruder
+        if !in_volume && line.contains(r#"type="object""#) && line.contains(r#"key="extruder""#) {
+            if let Some(caps) = object_extruder_regex.captures(line) {
+                object_extruder = caps.get(1).and_then(|m| m.as_str().parse().ok());
+            }
+        }
+        
+        // Check for volume start with triangle range
+        if let Some(caps) = volume_regex.captures(line) {
+            // Save previous volume if any
+            if in_volume && current_first_id.is_some() && current_last_id.is_some() {
+                let color = current_color.or_else(|| {
+                    // Try volume extruder first, then fall back to object extruder
+                    current_extruder.or(object_extruder).and_then(|ext| {
+                        if ext > 0 && ext <= extruder_colors.len() {
+                            Some(extruder_colors[ext - 1])
+                        } else {
+                            None
+                        }
+                    })
+                });
+                
+                current_volumes.push(VolumeInfo {
+                    first_triangle_id: current_first_id.unwrap(),
+                    last_triangle_id: current_last_id.unwrap(),
+                    color,
+                });
+            }
+            
+            // Start new volume
+            in_volume = true;
+            current_first_id = caps.get(1).and_then(|m| m.as_str().parse().ok());
+            current_last_id = caps.get(2).and_then(|m| m.as_str().parse().ok());
+            current_extruder = None;
+            current_color = None;
+        }
+        
+        // Check for extruder in current volume
+        if in_volume && line.contains(r#"type="volume""#) && line.contains(r#"key="extruder""#) {
+            if let Some(caps) = volume_extruder_regex.captures(line) {
+                current_extruder = caps.get(1).and_then(|m| m.as_str().parse().ok());
+            }
+        }
+        
+        // Check for inline color in current volume
+        if in_volume {
+            if let Some(caps) = color_regex.captures(line) {
+                if let Some(color_str) = caps.get(1) {
+                    current_color = parse_hex_color_to_srgba(color_str.as_str());
+                }
+            }
+        }
+        
+        // Check for volume end
+        if line.contains("</volume>") && in_volume {
+            // Save current volume
+            if current_first_id.is_some() && current_last_id.is_some() {
+                let color = current_color.or_else(|| {
+                    // Try volume extruder first, then fall back to object extruder
+                    current_extruder.or(object_extruder).and_then(|ext| {
+                        if ext > 0 && ext <= extruder_colors.len() {
+                            Some(extruder_colors[ext - 1])
+                        } else {
+                            None
+                        }
+                    })
+                });
+                
+                current_volumes.push(VolumeInfo {
+                    first_triangle_id: current_first_id.unwrap(),
+                    last_triangle_id: current_last_id.unwrap(),
+                    color,
+                });
+            }
+            
+            in_volume = false;
+            current_first_id = None;
+            current_last_id = None;
+            current_extruder = None;
+            current_color = None;
+        }
+    }
+    
+    // Don't forget the last object
+    if let Some(obj_id) = current_object_id {
+        if !current_volumes.is_empty() {
+            object_volumes.insert(obj_id, current_volumes);
+        }
+    }
+}
+
+// Parse hex color string to Srgba
+fn parse_hex_color_to_srgba(hex: &str) -> Option<Srgba> {
+    let hex = hex.trim_start_matches('#');
+    if hex.len() != 6 {
+        return None;
+    }
+    
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    
+    Some(Srgba::new_opaque(r, g, b))
+}
 
 fn parse_stl(path : &str) -> Result<CpuMesh, ParseError>
 {

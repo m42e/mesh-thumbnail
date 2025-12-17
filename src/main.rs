@@ -197,8 +197,8 @@ fn main() {
 
         let possible_mesh = parse_mesh::parse_file((&absolute_path).to_str().take().unwrap());
 
-        if let Ok(mesh) = possible_mesh {
-            render_model(&context, &viewport, &mesh, alpha, &file, &image_path, &args.color, args.rotatex, args.rotatey, &mut texture, &mut depth_texture, args.images_per_file, args.inverse_zoom);
+        if let Ok(parse_result) = possible_mesh {
+            render_model(&context, &viewport, &parse_result, alpha, &file, &image_path, &args.color, args.rotatex, args.rotatey, &mut texture, &mut depth_texture, args.images_per_file, args.inverse_zoom);
         } else if let Err(e) = possible_mesh {
             println!("Error while converting {}: {}.", filename, e.to_string());
 
@@ -216,7 +216,7 @@ fn main() {
 fn render_model(
     context: &HeadlessContext,
     viewport: &Viewport,
-    mesh: &CpuMesh,
+    parse_result: &parse_mesh::ParseResult,
     alpha: f32,
     file: &str,
     image_path: &PathBuf,
@@ -228,22 +228,32 @@ fn render_model(
     count : u32,
     scale : f32,
 ) {
-    let color = parse_hex_color(color).unwrap();
-    let mut model = Gm::new(
-        Mesh::new(&context, &mesh),
-        solid_material::SolidMaterial::new_opaque(&context,
-            &CpuMaterial {
-                albedo: Srgba::new_opaque((color >> 16 & 0xFF) as u8, (color >> 8 & 0xFF) as u8, (color & 0xFF) as u8),
-                ..Default::default()
-            }),
-        );
+    let default_color = parse_hex_color(color).unwrap();
+    let default_srgba = Srgba::new_opaque((default_color >> 16 & 0xFF) as u8, (default_color >> 8 & 0xFF) as u8, (default_color & 0xFF) as u8);
+    
+    // Create all models with their materials and transformations
+    let mut models: Vec<Gm<Mesh, solid_material::SolidMaterial>> = parse_result.meshes
+        .iter()
+        .map(|mesh_with_transform| {
+            // Use the mesh's color if available, otherwise use the default color
+            let albedo = mesh_with_transform.color.unwrap_or(default_srgba);
+            
+            Gm::new(
+                Mesh::new(&context, &mesh_with_transform.mesh),
+                solid_material::SolidMaterial::new_opaque(&context,
+                    &CpuMaterial {
+                        albedo,
+                        ..Default::default()
+                    }),
+            )
+        })
+        .collect();
 
     for iter in 0..count {
         let mut iter_file_path = PathBuf::clone(image_path);
         let mut local_rotatex = rotatex;
 
         if count > 1 {
-            model.set_transformation(Mat4::one());
             let new_name = format!("{}-{:02}", iter_file_path.file_stem().unwrap().to_str().unwrap(), iter);
             replace_file_stem(&mut iter_file_path, &new_name);
         }
@@ -252,7 +262,29 @@ fn render_model(
             local_rotatex += (360.0 / count as f32) * iter as f32;
         }
 
-        let mut offset = Mat4::from_translation(model.aabb().min() * -1.0) * Mat4::from_translation((model.aabb().min() - model.aabb().max()) / 2f32);
+        // Calculate the combined bounding box for all meshes
+        let mut combined_min = vec3(f32::INFINITY, f32::INFINITY, f32::INFINITY);
+        let mut combined_max = vec3(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+        
+        for (idx, model) in models.iter_mut().enumerate() {
+            let mesh_transform = parse_result.meshes[idx].transform;
+            model.set_transformation(mesh_transform);
+            
+            let aabb = model.aabb();
+            combined_min = vec3(
+                combined_min.x.min(aabb.min().x),
+                combined_min.y.min(aabb.min().y),
+                combined_min.z.min(aabb.min().z),
+            );
+            combined_max = vec3(
+                combined_max.x.max(aabb.max().x),
+                combined_max.y.max(aabb.max().y),
+                combined_max.z.max(aabb.max().z),
+            );
+        }
+
+        // Apply centering and rotation offset to all models
+        let mut offset = Mat4::from_translation(combined_min * -1.0) * Mat4::from_translation((combined_min - combined_max) / 2f32);
 
         if file.ends_with(".stl") 
             || file.ends_with(".stl.zip")
@@ -267,9 +299,14 @@ fn render_model(
         {
             offset = Mat4::from_angle_y(Deg(180.0)) * offset;
         }
-        model.set_transformation(offset);
+        
+        // Apply the offset to all models
+        for (idx, model) in models.iter_mut().enumerate() {
+            let mesh_transform = parse_result.meshes[idx].transform;
+            model.set_transformation(offset * mesh_transform);
+        }
 
-        let magnitude = (model.aabb().min() - model.aabb().max()).magnitude() * scale;
+        let magnitude = (combined_min - combined_max).magnitude() * scale;
 
         let pitch = rotatey.clamp(-90.0, 90.0).to_radians();
         let yaw = local_rotatex.to_radians();
@@ -288,14 +325,17 @@ fn render_model(
             1000.0,
         );
 
+        // Render all models
+        let model_refs: Vec<&dyn Object> = models.iter().map(|m| m as &dyn Object).collect();
+        
         let pixels : Vec<[u8; 4]> = RenderTarget::new(
             texture.as_color_target(None),
             depth_texture.as_depth_target(),
         )
         // Clear color and depth of the render target
         .clear(ClearState::color_and_depth(0.2, 0.2, 0.2, alpha, 1.0))
-        // Render the triangle with the per vertex colors defined at construction
-        .render(&camera, &model, &[])
+        // Render all models
+        .render(&camera, &model_refs, &[])
         .read_color();
 
         three_d_asset::io::save(
