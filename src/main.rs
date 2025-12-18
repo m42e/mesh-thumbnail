@@ -1,17 +1,7 @@
-use base64::{prelude::BASE64_STANDARD, Engine};
 use clap::Parser;
-use image::{imageops::FilterType::Triangle, ImageReader};
-use std::{ffi::OsString, io::{BufRead, BufReader, Lines, Read}, num::ParseIntError, path::PathBuf};
-use clap::ValueEnum;
-use std::path;
-use three_d::*;
-use three_d_asset::io::Serialize;
-use std::fs::File;
-use zip::{result::ZipError, ZipArchive};
-use std::io::Cursor;
+use std::path::PathBuf;
 
-mod parse_mesh;
-mod solid_material;
+use mesh_thumbnail::{generate_thumbnail_for_file, Format, ThumbnailOptions};
 
 #[derive(Parser, Debug)]
 #[command(name = "mesh-thumbnail", about = "3D file thumbnail generator", version = "0.1")]
@@ -62,7 +52,7 @@ struct Args {
     #[arg(long, default_value_t = false)]
     prefer_3mf_thumbnail: bool,
 
-    // Prefer gcode thumbnail over gcode model
+    /// Prefer gcode thumbnail over gcode model
     #[arg(long, default_value_t = false)]
     prefer_gcode_thumbnail: bool,
 
@@ -75,454 +65,45 @@ struct Args {
     inverse_zoom: f32,
 }
 
-fn parse_hex_color(s: &str) -> Result<u32, ParseIntError> {
-    u32::from_str_radix(s, 16)
-}
-
-#[derive(Debug, Clone, ValueEnum, PartialEq, Eq)]
-enum Format {
-    Jpg,
-    Png,
-}
-
-impl ToString for Format {
-    fn to_string(&self) -> String {
-      match self {
-        Format::Jpg => String::from("jpg"),
-        Format::Png => String::from("png"),  
-      }
-    }
-  }
-
 fn main() {
     let mut args = Args::parse();
 
-    if args.prefer_3mf_thumbnail
-    {
+    if args.prefer_3mf_thumbnail {
         args.fallback_3mf_thumbnail = false;
     }
 
-    if args.images_per_file < 1
-    {
+    if args.images_per_file < 1 {
         args.images_per_file = 1;
     }
 
-    if args.images_per_file > 1 && args.rotatex != 0.0
-    {
+    if args.images_per_file > 1 && args.rotatex != 0.0 {
         eprintln!("Warning: rotatex is ignored when generating multiple images per file.");
         args.rotatex = 0.0;
     }
 
     println!("Parsed arguments: {:#?}", args);
 
-    let viewport = Viewport::new_at_origo(args.width, args.height);
-    let context = HeadlessContext::new().unwrap();
-    let alpha = if args.format == Format::Jpg { 0.8 } else { 0.0 };
-
-    // Create a color texture to render into
-    let mut texture = Texture2D::new_empty::<[u8; 4]>(
-        &context,
-        viewport.width,
-        viewport.height,
-        Interpolation::Nearest,
-        Interpolation::Nearest,
-        None,
-        Wrapping::ClampToEdge,
-        Wrapping::ClampToEdge,
-    );
-        
-    // Also create a depth texture to support depth testing
-    let mut depth_texture = DepthTexture2D::new::<f32>(
-        &context,
-        viewport.width,
-        viewport.height,
-        Wrapping::ClampToEdge,
-        Wrapping::ClampToEdge,
-    );
-
-    for file in args.files
-    {
-        let absolute_path = path::absolute(&file).unwrap();
-        let mut extension = absolute_path.extension().take().unwrap().to_str().take().unwrap();
-        let filename = absolute_path.file_name().take().unwrap().to_str().take().unwrap();
-
-        if filename.ends_with(".stl.zip")
-        {
-            extension = "stl.zip";
-        }
-
-        if filename.ends_with(".obj.zip")
-        {
-            extension = "obj.zip";
-        }
-
-        if filename.ends_with(".gcode.zip")
-        {
-            extension = "gcode.zip";
-        }
-
-        let filename_image = format!("{}{}", &filename[..filename.len() - extension.len()] ,args.format.to_string());
-        let image_path = PathBuf::from(args.outdir.clone()).join(filename_image);
-        let image_path_str = image_path.to_str().take().unwrap();
-
-        if !args.overwrite && path::Path::new(image_path_str).exists()
-        {
-            println!("Path {} already exists, skipping {}...", image_path_str, filename);
-            continue;
-        }
-
-        if args.prefer_3mf_thumbnail && filename.ends_with(".3mf")
-        {
-            if extract_image_from_3mf(&absolute_path, args.width, args.height, &image_path).is_ok()
-            {
-                continue;
-            }
-        }
-
-        if args.prefer_gcode_thumbnail
-        {
-            if filename.ends_with(".gcode") {
-                if extract_image_from_gcode_file(&absolute_path, args.width, args.height, &image_path).is_ok()
-                {
-                    continue;
-                }
-            }
-            else if filename.ends_with(".gcode.zip") {
-                if extract_iamge_from_gcode_zip(&absolute_path, args.width, args.height, &image_path).is_ok()
-                {
-                    continue;
-                }
-            }
-        }
-
-        let possible_mesh = parse_mesh::parse_file((&absolute_path).to_str().take().unwrap());
-
-        if let Ok(parse_result) = possible_mesh {
-            render_model(&context, &viewport, &parse_result, alpha, &file, &image_path, &args.color, args.rotatex, args.rotatey, &mut texture, &mut depth_texture, args.images_per_file, args.inverse_zoom);
-        } else if let Err(e) = possible_mesh {
-            println!("Error while converting {}: {}.", filename, e.to_string());
-
-            if args.fallback_3mf_thumbnail && filename.ends_with(".3mf") && !args.prefer_3mf_thumbnail
-            {
-                if extract_image_from_3mf(&absolute_path, args.width, args.height, &image_path).is_err()
-                {
-                    println!("Fallback of extracting image also failed...");
-                }
-            }
-        }
-    }
-}
-
-fn render_model(
-    context: &HeadlessContext,
-    viewport: &Viewport,
-    parse_result: &parse_mesh::ParseResult,
-    alpha: f32,
-    file: &str,
-    image_path: &PathBuf,
-    color : &str,
-    rotatex: f32,
-    rotatey: f32,
-    texture: &mut Texture2D,
-    depth_texture: &mut DepthTexture2D,
-    count : u32,
-    scale : f32,
-) {
-    let default_color = parse_hex_color(color).unwrap();
-    let default_srgba = Srgba::new_opaque((default_color >> 16 & 0xFF) as u8, (default_color >> 8 & 0xFF) as u8, (default_color & 0xFF) as u8);
-    
-    // Create all models with their materials and transformations
-    let mut models: Vec<Gm<Mesh, solid_material::SolidMaterial>> = parse_result.meshes
-        .iter()
-        .map(|mesh_with_transform| {
-            // Use the mesh's color if available, otherwise use the default color
-            let albedo = mesh_with_transform.color.unwrap_or(default_srgba);
-            
-            Gm::new(
-                Mesh::new(&context, &mesh_with_transform.mesh),
-                solid_material::SolidMaterial::new_opaque(&context,
-                    &CpuMaterial {
-                        albedo,
-                        ..Default::default()
-                    }),
-            )
-        })
-        .collect();
-
-    for iter in 0..count {
-        let mut iter_file_path = PathBuf::clone(image_path);
-        let mut local_rotatex = rotatex;
-
-        if count > 1 {
-            let new_name = format!("{}-{:02}", iter_file_path.file_stem().unwrap().to_str().unwrap(), iter);
-            replace_file_stem(&mut iter_file_path, &new_name);
-        }
-
-        if iter > 0 {
-            local_rotatex += (360.0 / count as f32) * iter as f32;
-        }
-
-        // Calculate the combined bounding box for all meshes
-        let mut combined_min = vec3(f32::INFINITY, f32::INFINITY, f32::INFINITY);
-        let mut combined_max = vec3(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
-        
-        for (idx, model) in models.iter_mut().enumerate() {
-            let mesh_transform = parse_result.meshes[idx].transform;
-            model.set_transformation(mesh_transform);
-            
-            let aabb = model.aabb();
-            combined_min = vec3(
-                combined_min.x.min(aabb.min().x),
-                combined_min.y.min(aabb.min().y),
-                combined_min.z.min(aabb.min().z),
-            );
-            combined_max = vec3(
-                combined_max.x.max(aabb.max().x),
-                combined_max.y.max(aabb.max().y),
-                combined_max.z.max(aabb.max().z),
-            );
-        }
-
-        // Apply centering and rotation offset to all models
-        let mut offset = Mat4::from_translation(combined_min * -1.0) * Mat4::from_translation((combined_min - combined_max) / 2f32);
-
-        if file.ends_with(".stl") 
-            || file.ends_with(".stl.zip")
-            || file.ends_with(".3mf")
-            || file.ends_with(".obj")
-            || file.ends_with(".obj.zip")
-        {
-            offset = Mat4::from_angle_x(Deg(270.0)) * offset;
-        }
-        else if file.ends_with("gcode")
-            || file.ends_with("gcode.zip")
-        {
-            offset = Mat4::from_angle_y(Deg(180.0)) * offset;
-        }
-        
-        // Apply the offset to all models
-        for (idx, model) in models.iter_mut().enumerate() {
-            let mesh_transform = parse_result.meshes[idx].transform;
-            model.set_transformation(offset * mesh_transform);
-        }
-
-        let magnitude = (combined_min - combined_max).magnitude() * scale;
-
-        let pitch = rotatey.clamp(-90.0, 90.0).to_radians();
-        let yaw = local_rotatex.to_radians();
-
-        let x = magnitude * pitch.cos() * yaw.sin();
-        let y = magnitude * pitch.sin();
-        let z = magnitude * pitch.cos() * yaw.cos();
-
-        let camera = Camera::new_perspective(
-            viewport.clone(),
-            vec3(x, y, z),
-            vec3(0.0, 0.0, 0.0),
-            vec3(0.0, 1.0, 0.0),
-            degrees(45.0),
-            magnitude * 0.01,
-            1000.0,
-        );
-
-        // Render all models
-        let model_refs: Vec<&dyn Object> = models.iter().map(|m| m as &dyn Object).collect();
-        
-        let pixels : Vec<[u8; 4]> = RenderTarget::new(
-            texture.as_color_target(None),
-            depth_texture.as_depth_target(),
-        )
-        // Clear color and depth of the render target
-        .clear(ClearState::color_and_depth(0.2, 0.2, 0.2, alpha, 1.0))
-        // Render all models
-        .render(&camera, &model_refs, &[])
-        .read_color();
-
-        three_d_asset::io::save(
-            &CpuTexture {
-                data: TextureData::RgbaU8(pixels),
-                width: texture.width(),
-                height: texture.height(),
-                ..Default::default()
-            }
-            .serialize(iter_file_path)
-            .unwrap(),
-        )
-        .unwrap();
-    }
-}
-
-fn extract_image_from_3mf(
-    threemf_path : &PathBuf,
-    width : u32,
-    height : u32,
-    image_path : &PathBuf,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Open 3mf path as zip file
-    let file = File::open(threemf_path)?;
-    let mut zip = ZipArchive::new(file)?;
-
-    for i in 0..zip.len() {
-        let mut file = zip.by_index(i)?;
-        if file.name().ends_with("thumbnail_middle.png") {
-            let mut buffer = Vec::with_capacity(file.size() as usize);
-            file.read_to_end(&mut buffer)?;
-
-            let step1 = ImageReader::new(Cursor::new(buffer)).with_guessed_format()?.decode()?;
-            let step2 = step1.resize_to_fill(width, height, Triangle);
-
-            step2.save(image_path)?;
-            return Ok(());
-        }
-    }
-
-    Err(Box::new(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        "thumbnail_middle.png not found in 3mf file",
-    )))
-}
-
-struct GcodeImage {
-    width: u32,
-    height: u32,
-    data: Vec<u8>,
-}
-
-impl GcodeImage {
-    fn area(&self) -> u32 {
-        self.width * self.height
-    }
-}
-
-trait IterateThroughFile {
-    fn next(&mut self) -> Option<String>;
-}
-
-struct IoFileIterator {
-    reader: Lines<BufReader<File>>,
-}
-
-impl IterateThroughFile for IoFileIterator {
-    fn next(&mut self) -> Option<String> {
-        match self.reader.next() {
-            Some(Ok(line)) => Some(line),
-            _ => None,
-        }
-    }
-}
-
-struct ZipFileIterator {
-    reader: Lines<BufReader<zip::read::ZipFile<'static, File>>>
-}
-
-impl IterateThroughFile for ZipFileIterator {
-    fn next(&mut self) -> Option<String> {
-        match self.reader.next() {
-            Some(Ok(line)) => Some(line),
-            _ => None,
-        }
-    }
-}
-
-fn extract_image_from_gcode_file(
-    gcode_path : &PathBuf,
-    width : u32,
-    height : u32,
-    image_path : &PathBuf,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut file = File::open(gcode_path)?;
-    extract_image_from_gcode(&mut file, width, height, image_path)
-}
-
-fn extract_iamge_from_gcode_zip(
-    gcode_zip_path : &PathBuf,
-    width : u32,
-    height : u32,
-    image_path : &PathBuf,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let file = File::open(gcode_zip_path)?;
-    let mut zip = ZipArchive::new(file)?;
-
-    for i in 0..zip.len() {
-        let mut file = zip.by_index(i)?;
-        if file.name().ends_with(".gcode") {
-            return extract_image_from_gcode(&mut file, width, height, image_path);
-        }
-    }
-
-    Err("No gcode file found in zip archive".into())
-}
-
-fn extract_image_from_gcode<W>(
-    reader : &mut W,
-    width : u32,
-    height : u32,
-    image_path : &PathBuf,
-) -> Result<(), Box<dyn std::error::Error>> where W: Read {
-    let buffered_reader = BufReader::new(reader);
-    let mut gcode_images : Vec<GcodeImage> = Vec::new();
-    let mut in_gcode_section = false;
-    let mut gcode_img_width = 0;
-    let mut gcode_img_height = 0;
-    let mut image = String::from("");
-
-    for line in buffered_reader.lines().map_while(Result::ok) {
-        if line.starts_with("; thumbnail begin") {
-            let pixel_format = match line.split(" ").skip(3).next() {
-                Some(s) => s,
-                None => continue
-            };
-
-            let pixel_format_unpacked: Vec<u32> = pixel_format.split("x").map(|f| f.parse().unwrap_or_default()).collect();
-
-            gcode_img_width = pixel_format_unpacked.get(0).unwrap_or(&0).clone();
-            gcode_img_height = pixel_format_unpacked.get(1).unwrap_or(&0).clone();
-            image = String::from("");
-
-            in_gcode_section = gcode_img_width > 0 && gcode_img_height > 0;
-        }
-        else if line.starts_with("; thumbnail end") {
-            in_gcode_section = false;
-            let image = match BASE64_STANDARD.decode(&image)  {
-                Ok(data) => data,
-                Err(e) => {
-                    println!("Error decoding base64 image data: {}", e);
-                    continue;
-                },
-            };
-
-            gcode_images.push(GcodeImage { width: gcode_img_width, height: gcode_img_height, data: image  });
-            
-        }
-        else if in_gcode_section {
-            image.push_str(line[2..].trim());
-        }
-        else if line.starts_with("; EXECUTABLE_BLOCK_START") {
-            break;
-        }
-    }
-
-    gcode_images.sort_by(|a, b| b.area().cmp(&a.area()));
-    println!("Found {} thumbnails in gcode file", gcode_images.len());
-
-    let largest_image = match gcode_images.first() {
-        Some(x) => x,
-        None => return Err("No thumbnail found in gcode file" .into()),
+    let options = ThumbnailOptions {
+        rotatex: args.rotatex,
+        rotatey: args.rotatey,
+        width: args.width,
+        height: args.height,
+        format: args.format,
+        color: args.color,
+        overwrite: args.overwrite,
+        fallback_3mf_thumbnail: args.fallback_3mf_thumbnail,
+        prefer_3mf_thumbnail: args.prefer_3mf_thumbnail,
+        prefer_gcode_thumbnail: args.prefer_gcode_thumbnail,
+        images_per_file: args.images_per_file,
+        inverse_zoom: args.inverse_zoom,
     };
 
-    println!("Using gcode image {}x{}", largest_image.width, largest_image.height);
+    let outdir = PathBuf::from(&args.outdir);
 
-    let step1 = ImageReader::new(Cursor::new(&largest_image.data)).with_guessed_format()?.decode()?;
-    let step2 = step1.resize_to_fill(width, height, Triangle);
-
-    step2.save(image_path)?;
-    return Ok(());
-}
-
-fn replace_file_stem(path: &mut PathBuf, new_stem: &str) {
-    if let Some(ext) = path.extension() {
-        path.set_file_name(format!("{}.{}", new_stem, ext.to_string_lossy()));
-    } else {
-        path.set_file_name(new_stem);
+    for file in args.files {
+        let path = PathBuf::from(&file);
+        if let Err(e) = generate_thumbnail_for_file(&path, &outdir, &options) {
+            eprintln!("Error while converting {}: {:?}.", file, e);
+        }
     }
 }
