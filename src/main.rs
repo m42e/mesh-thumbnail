@@ -1,10 +1,14 @@
 use clap::Parser;
 use std::path::PathBuf;
 
-use mesh_thumbnail::{generate_thumbnail_for_file, Format, ThumbnailOptions};
+use mesh_thumbnail::{Format, ThumbnailOptions, generate_thumbnail_for_file};
 
 #[derive(Parser, Debug)]
-#[command(name = "mesh-thumbnail", about = "3D file thumbnail generator", version = "0.1")]
+#[command(
+    name = "mesh-thumbnail",
+    about = "3D file thumbnail generator",
+    version = "0.1"
+)]
 struct Args {
     /// Rotation around the X-axis
     #[arg(long, default_value_t = 0.0)]

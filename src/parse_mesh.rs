@@ -1,16 +1,16 @@
 use regex::Regex;
+use std::io;
+use std::io::BufRead;
+use std::io::Read;
+use std::num::ParseFloatError;
+use std::{collections::HashMap, fs::File};
+use stl_io;
 use stl_io::IndexedMesh;
 use three_d::*;
 use threemf;
-use std::num::ParseFloatError;
-use std::{collections::HashMap, fs::File};
-use std::io;
-use std::io::Read;
-use std::io::BufRead;
-use stl_io;
+use wavefront_obj::obj::{self, ObjSet};
 use zip::ZipArchive;
 use zip::result::ZipError;
-use wavefront_obj::obj::{self, ObjSet};
 
 #[derive(Clone)]
 pub struct MeshWithTransform {
@@ -33,14 +33,13 @@ impl ParseResult {
             }],
         }
     }
-    
+
     pub fn multiple(meshes: Vec<MeshWithTransform>) -> Self {
         ParseResult { meshes }
     }
 }
 
-pub enum ParseError
-{
+pub enum ParseError {
     ReadError(String),
     ParseError(String),
     MeshConvertError(String),
@@ -50,108 +49,85 @@ impl ToString for ParseError {
     fn to_string(&self) -> String {
         match self {
             ParseError::ReadError(str) => String::from(format!("Failed to read file: {}", str)),
-            ParseError::ParseError(str) => String::from(format!("Failed to interpret model: {}", str)),
-            ParseError::MeshConvertError(str) => String::from(format!("Failed to convert mesh from model: {}", str)),
+            ParseError::ParseError(str) => {
+                String::from(format!("Failed to interpret model: {}", str))
+            }
+            ParseError::MeshConvertError(str) => {
+                String::from(format!("Failed to convert mesh from model: {}", str))
+            }
         }
     }
 }
 
-impl From<io::Error> for ParseError 
-{
-    fn from(e: io::Error) -> ParseError 
-    {
+impl From<io::Error> for ParseError {
+    fn from(e: io::Error) -> ParseError {
         ParseError::ReadError(e.to_string())
     }
 }
 
-impl From<threemf::Error> for ParseError
-{
-    fn from(e: threemf::Error) -> ParseError
-    {
+impl From<threemf::Error> for ParseError {
+    fn from(e: threemf::Error) -> ParseError {
         ParseError::ParseError(e.to_string())
     }
 }
 
-impl From<ZipError> for ParseError
-{
-    fn from(e: ZipError) -> ParseError
-    {
+impl From<ZipError> for ParseError {
+    fn from(e: ZipError) -> ParseError {
         ParseError::ReadError(e.to_string())
     }
 }
 
-impl From<three_d_asset::Error> for ParseError
-{
-    fn from(e: three_d_asset::Error) -> ParseError
-    {
+impl From<three_d_asset::Error> for ParseError {
+    fn from(e: three_d_asset::Error) -> ParseError {
         ParseError::MeshConvertError(e.to_string())
     }
 }
 
-impl From<wavefront_obj::ParseError> for ParseError
-{
-    fn from(e: wavefront_obj::ParseError) -> ParseError
-    {
+impl From<wavefront_obj::ParseError> for ParseError {
+    fn from(e: wavefront_obj::ParseError) -> ParseError {
         ParseError::ParseError(e.to_string())
     }
 }
 
-impl From<ParseFloatError> for ParseError
-{
-    fn from(e: ParseFloatError) -> ParseError
-    {
+impl From<ParseFloatError> for ParseError {
+    fn from(e: ParseFloatError) -> ParseError {
         ParseError::ParseError(e.to_string())
     }
 }
 
-pub fn parse_file(path : &str) -> Result<ParseResult, ParseError>
-{
-    if path.ends_with(".stl")
-    {
+pub fn parse_file(path: &str) -> Result<ParseResult, ParseError> {
+    if path.ends_with(".stl") {
         return Ok(ParseResult::single(parse_stl(path)?));
-    }
-    else if path.ends_with(".3mf")
-    {
-        return parse_3mf(path);   
-    }
-    else if path.ends_with(".stl.zip")
-    {
+    } else if path.ends_with(".3mf") {
+        return parse_3mf(path);
+    } else if path.ends_with(".stl.zip") {
         return Ok(ParseResult::single(parse_stl_zip(path)?));
-    }
-    else if path.ends_with(".obj")
-    {
+    } else if path.ends_with(".obj") {
         return Ok(ParseResult::single(parse_obj(path)?));
-    }
-    else if path.ends_with(".obj.zip")
-    {
+    } else if path.ends_with(".obj.zip") {
         return Ok(ParseResult::single(parse_obj_zip(path)?));
-    }
-    else if path.ends_with(".gcode")
-    {
+    } else if path.ends_with(".gcode") {
         return Ok(ParseResult::single(parse_gcode(path)?));
-    }
-    else if path.ends_with(".gcode.zip")
-    {
+    } else if path.ends_with(".gcode.zip") {
         return Ok(ParseResult::single(parse_gcode_zip(path)?));
     }
 
     return Err(ParseError::ParseError(String::from("Unknown file type")));
 }
 
-fn parse_3mf(path : &str) -> Result<ParseResult, ParseError>
-{
+fn parse_3mf(path: &str) -> Result<ParseResult, ParseError> {
     let handle = File::open(path)?;
     let mfmodel = threemf::read(handle)?;
 
     // Try to extract extruder colors from Slic3r config
     let extruder_colors = extract_extruder_colors_from_3mf(path);
-    
+
     // Try to extract object/volume information from Slic3r model config
     let object_volumes = extract_object_volumes_from_3mf(path, &extruder_colors);
 
     // Build a map of object ID to mesh
     let mut object_map: HashMap<usize, &threemf::Mesh> = HashMap::new();
-    
+
     for model in mfmodel.iter() {
         for object in model.resources.object.iter() {
             if let Some(mesh) = &object.mesh {
@@ -161,7 +137,9 @@ fn parse_3mf(path : &str) -> Result<ParseResult, ParseError>
     }
 
     if object_map.is_empty() {
-        return Err(ParseError::MeshConvertError(String::from("No meshes found in 3mf model")));
+        return Err(ParseError::MeshConvertError(String::from(
+            "No meshes found in 3mf model",
+        )));
     }
 
     let mut result_meshes: Vec<MeshWithTransform> = Vec::new();
@@ -172,7 +150,7 @@ fn parse_3mf(path : &str) -> Result<ParseResult, ParseError>
             if let Some(mesh) = object_map.get(&item.objectid) {
                 // Get volume information for this object
                 let volumes = object_volumes.get(&item.objectid);
-                
+
                 // Create transformation matrix from build item transform
                 let transform = if let Some(t) = &item.transform {
                     Mat4::from_cols(
@@ -201,7 +179,7 @@ fn parse_3mf(path : &str) -> Result<ParseResult, ParseError>
                         // Only include triangles in this volume's range
                         let start_tri = vol.first_triangle_id;
                         let end_tri = vol.last_triangle_id + 1; // +1 because lastid is inclusive
-                        
+
                         if end_tri <= mesh.triangles.triangle.len() {
                             indices.extend(
                                 mesh.triangles
@@ -209,7 +187,9 @@ fn parse_3mf(path : &str) -> Result<ParseResult, ParseError>
                                     .iter()
                                     .skip(start_tri)
                                     .take(end_tri - start_tri)
-                                    .flat_map(|a| [a.v1 as u32, a.v2 as u32, a.v3 as u32].into_iter()),
+                                    .flat_map(|a| {
+                                        [a.v1 as u32, a.v2 as u32, a.v3 as u32].into_iter()
+                                    }),
                             );
 
                             let cpu_mesh = CpuMesh {
@@ -296,7 +276,7 @@ fn parse_3mf(path : &str) -> Result<ParseResult, ParseError>
 // Extract extruder colors from Slic3r_PE.config in 3MF archive
 fn extract_extruder_colors_from_3mf(path: &str) -> Vec<Srgba> {
     let mut colors = Vec::new();
-    
+
     if let Ok(file) = File::open(path) {
         if let Ok(mut zip) = ZipArchive::new(file) {
             for i in 0..zip.len() {
@@ -308,9 +288,12 @@ fn extract_extruder_colors_from_3mf(path: &str) -> Vec<Srgba> {
                             for line in content.lines() {
                                 if line.starts_with("; extruder_colour =") {
                                     if let Some(colors_str) = line.split('=').nth(1) {
-                                        let color_strs: Vec<&str> = colors_str.trim().split(';').collect();
+                                        let color_strs: Vec<&str> =
+                                            colors_str.trim().split(';').collect();
                                         for color_str in color_strs {
-                                            if let Some(color) = parse_hex_color_to_srgba(color_str.trim()) {
+                                            if let Some(color) =
+                                                parse_hex_color_to_srgba(color_str.trim())
+                                            {
                                                 colors.push(color);
                                             }
                                         }
@@ -325,7 +308,7 @@ fn extract_extruder_colors_from_3mf(path: &str) -> Vec<Srgba> {
             }
         }
     }
-    
+
     colors
 }
 
@@ -337,9 +320,12 @@ struct VolumeInfo {
 }
 
 // Extract object-to-volume mappings with colors from Slic3r_PE_model.config
-fn extract_object_volumes_from_3mf(path: &str, extruder_colors: &[Srgba]) -> HashMap<usize, Vec<VolumeInfo>> {
+fn extract_object_volumes_from_3mf(
+    path: &str,
+    extruder_colors: &[Srgba],
+) -> HashMap<usize, Vec<VolumeInfo>> {
     let mut object_volumes: HashMap<usize, Vec<VolumeInfo>> = HashMap::new();
-    
+
     if let Ok(file) = File::open(path) {
         if let Ok(mut zip) = ZipArchive::new(file) {
             for i in 0..zip.len() {
@@ -355,18 +341,25 @@ fn extract_object_volumes_from_3mf(path: &str, extruder_colors: &[Srgba]) -> Has
             }
         }
     }
-    
+
     object_volumes
 }
 
 // Parse Slic3r_PE_model.config XML to extract volumes with their triangle ranges and colors
-fn parse_slic3r_volumes(content: &str, extruder_colors: &[Srgba], object_volumes: &mut HashMap<usize, Vec<VolumeInfo>>) {
+fn parse_slic3r_volumes(
+    content: &str,
+    extruder_colors: &[Srgba],
+    object_volumes: &mut HashMap<usize, Vec<VolumeInfo>>,
+) {
     let object_id_regex = Regex::new(r#"<object id="(\d+)""#).unwrap();
     let volume_regex = Regex::new(r#"<volume firstid="(\d+)" lastid="(\d+)">"#).unwrap();
-    let object_extruder_regex = Regex::new(r#"<metadata type="object" key="extruder" value="(\d+)""#).unwrap();
-    let volume_extruder_regex = Regex::new(r#"<metadata type="volume" key="extruder" value="(\d+)""#).unwrap();
-    let color_regex = Regex::new(r#"<metadata type="volume" key="color" value="(#[0-9A-Fa-f]{6})""#).unwrap();
-    
+    let object_extruder_regex =
+        Regex::new(r#"<metadata type="object" key="extruder" value="(\d+)""#).unwrap();
+    let volume_extruder_regex =
+        Regex::new(r#"<metadata type="volume" key="extruder" value="(\d+)""#).unwrap();
+    let color_regex =
+        Regex::new(r#"<metadata type="volume" key="color" value="(#[0-9A-Fa-f]{6})""#).unwrap();
+
     let mut current_object_id: Option<usize> = None;
     let mut object_extruder: Option<usize> = None;
     let mut current_volumes: Vec<VolumeInfo> = Vec::new();
@@ -375,7 +368,7 @@ fn parse_slic3r_volumes(content: &str, extruder_colors: &[Srgba], object_volumes
     let mut current_last_id: Option<usize> = None;
     let mut current_extruder: Option<usize> = None;
     let mut current_color: Option<Srgba> = None;
-    
+
     for line in content.lines() {
         // Check for object ID
         if let Some(caps) = object_id_regex.captures(line) {
@@ -385,21 +378,21 @@ fn parse_slic3r_volumes(content: &str, extruder_colors: &[Srgba], object_volumes
                     object_volumes.insert(obj_id, current_volumes.clone());
                 }
             }
-            
+
             // Start new object
             current_object_id = caps.get(1).and_then(|m| m.as_str().parse().ok());
             object_extruder = None;
             current_volumes.clear();
             in_volume = false;
         }
-        
+
         // Check for object-level extruder
         if !in_volume && line.contains(r#"type="object""#) && line.contains(r#"key="extruder""#) {
             if let Some(caps) = object_extruder_regex.captures(line) {
                 object_extruder = caps.get(1).and_then(|m| m.as_str().parse().ok());
             }
         }
-        
+
         // Check for volume start with triangle range
         if let Some(caps) = volume_regex.captures(line) {
             // Save previous volume if any
@@ -414,14 +407,14 @@ fn parse_slic3r_volumes(content: &str, extruder_colors: &[Srgba], object_volumes
                         }
                     })
                 });
-                
+
                 current_volumes.push(VolumeInfo {
                     first_triangle_id: current_first_id.unwrap(),
                     last_triangle_id: current_last_id.unwrap(),
                     color,
                 });
             }
-            
+
             // Start new volume
             in_volume = true;
             current_first_id = caps.get(1).and_then(|m| m.as_str().parse().ok());
@@ -429,14 +422,14 @@ fn parse_slic3r_volumes(content: &str, extruder_colors: &[Srgba], object_volumes
             current_extruder = None;
             current_color = None;
         }
-        
+
         // Check for extruder in current volume
         if in_volume && line.contains(r#"type="volume""#) && line.contains(r#"key="extruder""#) {
             if let Some(caps) = volume_extruder_regex.captures(line) {
                 current_extruder = caps.get(1).and_then(|m| m.as_str().parse().ok());
             }
         }
-        
+
         // Check for inline color in current volume
         if in_volume {
             if let Some(caps) = color_regex.captures(line) {
@@ -445,7 +438,7 @@ fn parse_slic3r_volumes(content: &str, extruder_colors: &[Srgba], object_volumes
                 }
             }
         }
-        
+
         // Check for volume end
         if line.contains("</volume>") && in_volume {
             // Save current volume
@@ -460,14 +453,14 @@ fn parse_slic3r_volumes(content: &str, extruder_colors: &[Srgba], object_volumes
                         }
                     })
                 });
-                
+
                 current_volumes.push(VolumeInfo {
                     first_triangle_id: current_first_id.unwrap(),
                     last_triangle_id: current_last_id.unwrap(),
                     color,
                 });
             }
-            
+
             in_volume = false;
             current_first_id = None;
             current_last_id = None;
@@ -475,7 +468,7 @@ fn parse_slic3r_volumes(content: &str, extruder_colors: &[Srgba], object_volumes
             current_color = None;
         }
     }
-    
+
     // Don't forget the last object
     if let Some(obj_id) = current_object_id {
         if !current_volumes.is_empty() {
@@ -490,24 +483,22 @@ fn parse_hex_color_to_srgba(hex: &str) -> Option<Srgba> {
     if hex.len() != 6 {
         return None;
     }
-    
+
     let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
     let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
     let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-    
+
     Some(Srgba::new_opaque(r, g, b))
 }
 
-fn parse_stl(path : &str) -> Result<CpuMesh, ParseError>
-{
+fn parse_stl(path: &str) -> Result<CpuMesh, ParseError> {
     let mut handle = File::open(path)?;
     let stl = stl_io::read_stl(&mut handle)?;
 
     parse_stl_inner(&stl)
 }
 
-fn parse_stl_zip(path : &str) -> Result<CpuMesh, ParseError>
-{
+fn parse_stl_zip(path: &str) -> Result<CpuMesh, ParseError> {
     let handle = File::open(path)?;
     let mut zip = ZipArchive::new(handle)?;
 
@@ -522,12 +513,13 @@ fn parse_stl_zip(path : &str) -> Result<CpuMesh, ParseError>
             return parse_stl_inner(&stl);
         }
     }
-    
-    return Err(ParseError::MeshConvertError(String::from("Failed to find .stl model in zip")));
+
+    return Err(ParseError::MeshConvertError(String::from(
+        "Failed to find .stl model in zip",
+    )));
 }
 
-fn parse_obj(path : &str) -> Result<CpuMesh, ParseError>
-{
+fn parse_obj(path: &str) -> Result<CpuMesh, ParseError> {
     let mut handle = File::open(path)?;
     let mut buffer = Vec::new();
     handle.read_to_end(&mut buffer)?;
@@ -536,8 +528,7 @@ fn parse_obj(path : &str) -> Result<CpuMesh, ParseError>
     parse_obj_inner(&obj)
 }
 
-fn parse_obj_zip(path : &str) -> Result<CpuMesh, ParseError>
-{
+fn parse_obj_zip(path: &str) -> Result<CpuMesh, ParseError> {
     let handle = File::open(path)?;
     let mut zip = ZipArchive::new(handle)?;
 
@@ -547,16 +538,19 @@ fn parse_obj_zip(path : &str) -> Result<CpuMesh, ParseError>
             let mut buffer = Vec::with_capacity(file.size() as usize);
             file.read_to_end(&mut buffer)?;
 
-            return Ok(parse_obj_inner(&obj::parse(std::str::from_utf8(&buffer).unwrap())?)?);
+            return Ok(parse_obj_inner(&obj::parse(
+                std::str::from_utf8(&buffer).unwrap(),
+            )?)?);
         }
     }
-    
-    return Err(ParseError::MeshConvertError(String::from("Failed to find .obj model in zip")));
+
+    return Err(ParseError::MeshConvertError(String::from(
+        "Failed to find .obj model in zip",
+    )));
 }
 
 // https://github.com/asny/three-d-asset/blob/main/src/io/stl.rs#L9
-fn parse_stl_inner(stl : &IndexedMesh) -> Result<CpuMesh, ParseError>
-{
+fn parse_stl_inner(stl: &IndexedMesh) -> Result<CpuMesh, ParseError> {
     let positions = stl
         .vertices
         .iter()
@@ -573,87 +567,86 @@ fn parse_stl_inner(stl : &IndexedMesh) -> Result<CpuMesh, ParseError>
         .flat_map(|f| f.vertices.map(|a| a as u32))
         .collect();
 
-    Ok(
-        CpuMesh {
-            positions: Positions::F32(positions),
-            indices: Indices::U32(indices),
-            ..Default::default()
-        }
-    )
+    Ok(CpuMesh {
+        positions: Positions::F32(positions),
+        indices: Indices::U32(indices),
+        ..Default::default()
+    })
 }
 
 // https://github.com/asny/three-d-asset/blob/main/src/io/obj.rs#L54
-fn parse_obj_inner(obj : &ObjSet) -> Result<CpuMesh, ParseError>
-{
-    let mut all_meshes : Vec<CpuMesh> = obj.objects.iter().map(|object| {
-        let mut positions = Vec::new();
-        let mut indices = Vec::new();
-         for mesh in object.geometry.iter() { 
-             let mut map: HashMap<usize, usize> = HashMap::new();
- 
-             let mut process = |i: wavefront_obj::obj::VTNIndex| {
-                 let mut index = map.get(&i.0).map(|v| *v);
- 
-                 if index.is_none() {
-                     index = Some(positions.len());
-                     map.insert(i.0, index.unwrap());
-                     let position = object.vertices[i.0];
-                     positions.push(Vector3::new(position.x, position.y, position.z));
-                 }
- 
-                 indices.push(index.unwrap() as u32);
-             };
-             for shape in mesh.shapes.iter() {
-                 // All triangles with same material
-                 match shape.primitive {
-                     wavefront_obj::obj::Primitive::Triangle(i0, i1, i2) => {
-                         process(i0);
-                         process(i1);
-                         process(i2);
-                     }
-                     _ => {}
-                 }
-             }
-         }
+fn parse_obj_inner(obj: &ObjSet) -> Result<CpuMesh, ParseError> {
+    let mut all_meshes: Vec<CpuMesh> = obj
+        .objects
+        .iter()
+        .map(|object| {
+            let mut positions = Vec::new();
+            let mut indices = Vec::new();
+            for mesh in object.geometry.iter() {
+                let mut map: HashMap<usize, usize> = HashMap::new();
 
-         CpuMesh {
-            positions: Positions::F64(positions),
-            indices: Indices::U32(indices),
-            ..Default::default()
-        }
-     }).collect();
+                let mut process = |i: wavefront_obj::obj::VTNIndex| {
+                    let mut index = map.get(&i.0).map(|v| *v);
 
-     all_meshes.sort_by(|a, b| a.indices.len().cmp(&b.indices.len()).reverse());
+                    if index.is_none() {
+                        index = Some(positions.len());
+                        map.insert(i.0, index.unwrap());
+                        let position = object.vertices[i.0];
+                        positions.push(Vector3::new(position.x, position.y, position.z));
+                    }
 
-     if all_meshes.len() <= 0
-     {
-         return Err(ParseError::MeshConvertError(String::from("No meshes found in 3mf model")));
-     }
- 
-     let mesh = &all_meshes[0];
+                    indices.push(index.unwrap() as u32);
+                };
+                for shape in mesh.shapes.iter() {
+                    // All triangles with same material
+                    match shape.primitive {
+                        wavefront_obj::obj::Primitive::Triangle(i0, i1, i2) => {
+                            process(i0);
+                            process(i1);
+                            process(i2);
+                        }
+                        _ => {}
+                    }
+                }
+            }
 
-     return Ok(CpuMesh {
+            CpuMesh {
+                positions: Positions::F64(positions),
+                indices: Indices::U32(indices),
+                ..Default::default()
+            }
+        })
+        .collect();
+
+    all_meshes.sort_by(|a, b| a.indices.len().cmp(&b.indices.len()).reverse());
+
+    if all_meshes.len() <= 0 {
+        return Err(ParseError::MeshConvertError(String::from(
+            "No meshes found in 3mf model",
+        )));
+    }
+
+    let mesh = &all_meshes[0];
+
+    return Ok(CpuMesh {
         positions: mesh.positions.clone(),
         indices: mesh.indices.clone(),
         ..Default::default()
-     });
+    });
 }
 
-struct Point 
-{
+struct Point {
     v: Vec3,
     use_line: bool,
 }
 
-fn parse_gcode(path : &str) -> Result<CpuMesh, ParseError>
-{
+fn parse_gcode(path: &str) -> Result<CpuMesh, ParseError> {
     let mut handle = File::open(path)?;
 
     parse_gcode_inner(&mut handle)
 }
 
-fn parse_gcode_zip(path : &str) -> Result<CpuMesh, ParseError>
-{
+fn parse_gcode_zip(path: &str) -> Result<CpuMesh, ParseError> {
     let handle = File::open(path)?;
     let mut zip = ZipArchive::new(handle)?;
 
@@ -667,12 +660,14 @@ fn parse_gcode_zip(path : &str) -> Result<CpuMesh, ParseError>
             return parse_gcode_inner(&mut cursor);
         }
     }
-    
-    return Err(ParseError::MeshConvertError(String::from("Failed to find .stl model in zip")));
+
+    return Err(ParseError::MeshConvertError(String::from(
+        "Failed to find .stl model in zip",
+    )));
 }
 fn parse_gcode_inner<W>(reader: &mut W) -> Result<CpuMesh, ParseError>
 where
-    W: Read
+    W: Read,
 {
     let reader = io::BufReader::new(reader);
     let mut entries = Vec::with_capacity(0x10000);
@@ -687,26 +682,27 @@ where
     for line in reader.lines() {
         let line = line?;
         if line.starts_with("G1") || line.starts_with("G0") {
-            if let Some(caps) = regex_z.captures(&line)
-            {
+            if let Some(caps) = regex_z.captures(&line) {
                 last_z = caps.get(1).unwrap().as_str().parse::<f32>()?;
             }
 
-            if let Some(caps) = regex_xy.captures(&line) 
-            {
-                if position_unsafe
-                {
-                    entries.push(Point { v: vec3(-last_x, last_z, last_y), use_line: false});
+            if let Some(caps) = regex_xy.captures(&line) {
+                if position_unsafe {
+                    entries.push(Point {
+                        v: vec3(-last_x, last_z, last_y),
+                        use_line: false,
+                    });
                     position_unsafe = false;
                 }
 
                 last_x = caps.get(1).unwrap().as_str().parse::<f32>()?;
                 last_y = caps.get(2).unwrap().as_str().parse::<f32>()?;
 
-                entries.push(Point { v: vec3(-last_x, last_z, last_y), use_line: true});
-            }
-            else if let Some(caps) = regex_xy_no_extrusion.captures(&line)
-            {
+                entries.push(Point {
+                    v: vec3(-last_x, last_z, last_y),
+                    use_line: true,
+                });
+            } else if let Some(caps) = regex_xy_no_extrusion.captures(&line) {
                 last_x = caps.get(1).unwrap().as_str().parse::<f32>()?;
                 last_y = caps.get(2).unwrap().as_str().parse::<f32>()?;
                 position_unsafe = true;
@@ -714,9 +710,10 @@ where
         }
     }
 
-    if entries.len() <= 2
-    {
-        return Err(ParseError::ParseError(String::from("Gcode file contains no move instructions")));
+    if entries.len() <= 2 {
+        return Err(ParseError::ParseError(String::from(
+            "Gcode file contains no move instructions",
+        )));
     }
 
     let angle_subdivisions = if entries.len() < 1000000 { 3 } else { 2 };
@@ -730,8 +727,7 @@ where
     let mut indices = Vec::with_capacity(test_cylinder.indices.len().unwrap() * estimated_entries);
 
     for i in 0..entries.len() - 1 {
-        if !entries[i + 1].use_line
-        {
+        if !entries[i + 1].use_line {
             continue;
         }
 
@@ -742,23 +738,16 @@ where
 
         let l = positions.len() as u32;
 
-        positions.extend(
-            cylinder.positions.into_f32()
-        );
+        positions.extend(cylinder.positions.into_f32());
 
-        indices.extend(
-            cylinder.indices.into_u32()
-                .unwrap()
-                .iter()
-                .map(|i| *i + l)
-        );
+        indices.extend(cylinder.indices.into_u32().unwrap().iter().map(|i| *i + l));
     }
-    
+
     return Ok(CpuMesh {
         positions: Positions::F32(positions.clone()),
         indices: Indices::U32(indices.clone()),
         ..Default::default()
-     });
+    });
 }
 
 // Smart code from https://github.com/asny/three-d/blob/master/examples/wireframe/src/main.rs
